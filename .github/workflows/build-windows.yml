@@ -10,6 +10,9 @@ on:
 jobs:
   build-windows:
     runs-on: windows-latest
+    env:
+      PYTHONIOENCODING: utf-8
+      PYTHONUTF8: '1'
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -28,6 +31,8 @@ jobs:
 
       - name: Build EXE
         shell: pwsh
+        env:
+          PYTHONUTF8: '1'
         run: |
           pyinstaller --onefile --name ai_game `
             --add-data "scripts;scripts" `
@@ -40,7 +45,11 @@ jobs:
 
       - name: Test EXE
         shell: pwsh
+        env:
+          PYTHONIOENCODING: utf-8
+          PYTHONUTF8: '1'
         run: |
+          chcp 65001
           .\dist\ai_game.exe stats
 
       - name: Upload artifact

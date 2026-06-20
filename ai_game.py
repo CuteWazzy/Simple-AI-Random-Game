@@ -14,6 +14,19 @@ import sys
 import os
 import random
 
+# Windows 编码兜底：确保中文能正常输出
+if sys.platform == 'win32':
+    try:
+        sys.stdout.reconfigure(encoding='utf-8')
+        sys.stderr.reconfigure(encoding='utf-8')
+    except Exception:
+        pass
+    # 设置控制台代码页为 UTF-8
+    try:
+        os.system('chcp 65001 > nul 2>&1')
+    except Exception:
+        pass
+
 # 确保能找到 scripts 目录（多种路径兼容）
 def _setup_path():
     """设置模块搜索路径，兼容多种运行方式。"""
