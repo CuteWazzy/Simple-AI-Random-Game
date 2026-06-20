@@ -363,6 +363,232 @@ def show_stats(net):
     print(f"状态维度: {Game.STATE_SIZE}")
 
 
+def find_writable_model_path():
+    """找一个可写的模型保存路径。"""
+    candidates = []
+    base = os.path.dirname(os.path.abspath(sys.argv[0]))
+    candidates.append(os.path.join(base, 'models', 'genetic_model.pt'))
+    candidates.append(os.path.join(base, 'genetic_model.pt'))
+    candidates.append(os.path.join(os.getcwd(), 'models', 'genetic_model.pt'))
+    candidates.append(os.path.join(os.getcwd(), 'genetic_model.pt'))
+    home = os.path.expanduser('~')
+    candidates.append(os.path.join(home, 'ai_game_models', 'genetic_model.pt'))
+    for path in candidates:
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            test_file = path + '.tmp'
+            with open(test_file, 'w') as f:
+                f.write('test')
+            os.remove(test_file)
+            return path
+        except Exception:
+            continue
+    return os.path.join(os.getcwd(), 'genetic_model.pt')
+
+
+def run_genetic_train(num_generations=10, iters_per_gen=8, num_workers=4):
+    """运行遗传算法训练。"""
+    from genetic_train import (
+        DEFAULT_CONFIGS, load_or_init_net, _train_worker,
+        crossover_nets, mutate_net, tournament,
+    )
+    from copy import deepcopy
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+    import time
+
+    output_path = find_writable_model_path()
+    print(f"\n[训练] 模型将保存到: {output_path}")
+    print(f"[训练] {num_generations} 代 × {iters_per_gen} 轮 × 4 种群 = {num_generations*iters_per_gen*4} 局自博弈")
+    print()
+
+    seed = 42
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+    start_gen = 0
+    best_net = None
+    best_win_rate = -1.0
+    best_name = None
+
+    if os.path.exists(output_path):
+        try:
+            old_ckpt = torch.load(output_path, map_location='cpu', weights_only=False)
+            start_gen = old_ckpt.get('generation', 0)
+            best_win_rate = old_ckpt.get('win_rate', -1.0)
+            best_name = old_ckpt.get('best_name', None)
+            if 'model' in old_ckpt:
+                best_net = PolicyValueNet()
+                best_net.load_state_dict(old_ckpt['model'])
+                best_net.eval()
+            if best_name:
+                print(f"[续训] 从第 {start_gen} 代继续，历史最佳: [{best_name}] 胜率={best_win_rate*100:.1f}%", flush=True)
+        except Exception as e:
+            print(f"[续训] 加载失败：{e}，从头开始", flush=True)
+
+    base_ckpt = output_path if os.path.exists(output_path) else find_model()
+    populations = []
+    for config in DEFAULT_CONFIGS:
+        net = load_or_init_net(config, base_ckpt)
+        populations.append({
+            'name': config.name, 'config': config, 'net': net,
+            'win_rate': 0.0, 'history': [], 'train_stats': {},
+        })
+        print(f"  初始化种群 [{config.name}] 激活={config.activation} T={config.temperature}", flush=True)
+
+    for gen in range(start_gen, start_gen + num_generations):
+        gen_start = time.time()
+        print(f"\n{'='*60}")
+        print(f"  第 {gen+1} 代 (目标 {start_gen + num_generations})")
+        print(f"{'='*60}")
+
+        print(f"\n[阶段 1] 多进程并行训练 ({iters_per_gen} 轮/种群)...")
+        train_start = time.time()
+
+        worker_args = []
+        for pop in populations:
+            cfg_copy = deepcopy(pop['config'])
+            init_state = {k: v.clone() for k, v in pop['net'].state_dict().items()}
+            base_seed_i = seed + gen * 1000 + (hash(pop['name']) & 0xFFFF)
+            worker_args.append((cfg_copy, init_state, iters_per_gen, base_seed_i))
+
+        try:
+            with ProcessPoolExecutor(max_workers=num_workers) as executor:
+                futures = [executor.submit(_train_worker, arg) for arg in worker_args]
+                results = {}
+                for future in as_completed(futures):
+                    name, state_dict, stats, cfg_dict = future.result()
+                    results[name] = (state_dict, stats, cfg_dict)
+        except Exception as e:
+            print(f"  [错误] 多进程训练失败: {e}")
+            print(f"  [提示] 在 exe 模式下多进程可能受限，建议用源码版训练")
+            return
+
+        for pop in populations:
+            if pop['name'] in results:
+                state_dict, stats, cfg_dict = results[pop['name']]
+                pop['net'].load_state_dict(state_dict)
+                pop['config'].temperature = cfg_dict['temperature']
+                pop['train_stats'] = stats
+                print(f"  [{pop['name']}] loss={stats['avg_loss']:.4f} T={pop['config'].temperature:.3f}", flush=True)
+
+        train_time = time.time() - train_start
+        print(f"  训练耗时: {train_time:.1f}s")
+
+        print(f"\n[阶段 2] 锦标赛评估...")
+        win_rates = tournament(populations, num_matches_per_pair=2, seed=seed + gen * 100)
+        for pop in populations:
+            pop['win_rate'] = win_rates.get(pop['name'], 0.0)
+            pop['history'].append(pop['win_rate'])
+        print(f"  胜率:")
+        for pop in sorted(populations, key=lambda x: -x['win_rate']):
+            print(f"    {pop['name']}: {pop['win_rate']*100:.1f}%", flush=True)
+
+        if gen < start_gen + num_generations - 1:
+            print(f"\n[阶段 3] 遗传操作...")
+            sorted_pops = sorted(populations, key=lambda x: -x['win_rate'])
+            elite = sorted_pops[0]
+            print(f"  精英: [{elite['name']}] 胜率={elite['win_rate']*100:.1f}%")
+            top2 = sorted_pops[:2]
+            new_populations = [elite]
+            for i in range(1, len(populations)):
+                alpha = random.random()
+                child_net = crossover_nets(top2[0]['net'], top2[1]['net'], alpha=alpha)
+                child_net = mutate_net(child_net, mutation_rate=0.1, mutation_std=0.03,
+                                       rng=random.Random(seed + gen * 100 + i))
+                new_populations.append({
+                    'name': sorted_pops[i]['name'], 'config': sorted_pops[i]['config'],
+                    'net': child_net, 'win_rate': 0.0, 'history': sorted_pops[i]['history'],
+                    'train_stats': {},
+                })
+            populations = new_populations
+            print(f"  产生 {len(new_populations)-1} 个后代")
+
+        for pop in populations:
+            if pop['win_rate'] > best_win_rate:
+                best_win_rate = pop['win_rate']
+                best_net = deepcopy(pop['net'])
+                best_name = pop['name']
+        if best_net is None:
+            best_net = deepcopy(sorted(populations, key=lambda x: -x['win_rate'])[0]['net'])
+
+        try:
+            ckpt = {
+                'model': best_net.state_dict(),
+                'iteration': (gen + 1) * iters_per_gen,
+                'win_rate': best_win_rate, 'best_name': best_name,
+                'generation': gen + 1,
+                'populations_history': {p['name']: p['history'] for p in populations},
+            }
+            torch.save(ckpt, output_path)
+            print(f"\n  -> 已保存到 {output_path}")
+        except Exception as e:
+            print(f"\n  [警告] 保存失败: {e}")
+
+        gen_time = time.time() - gen_start
+        print(f"  -> 第 {gen+1} 代完成，耗时 {gen_time:.1f}s")
+        print(f"  -> 历史最佳: [{best_name}] 胜率={best_win_rate*100:.1f}%")
+
+    print(f"\n{'='*60}")
+    print(f"  训练完成！")
+    print(f"  最佳种群: [{best_name}] 胜率={best_win_rate*100:.1f}%")
+    print(f"  模型保存至: {output_path}")
+    print(f"{'='*60}")
+
+
+def run_single_train(num_iters=100, games_per_iter=24):
+    """单种群训练。"""
+    from train import train as train_fn
+    output_path = find_writable_model_path()
+    print(f"\n[训练] 模型将保存到: {output_path}")
+    print(f"[训练] {num_iters} 轮 × {games_per_iter} 局/轮 = {num_iters*games_per_iter} 局自博弈")
+    print()
+    try:
+        train_fn(num_iterations=num_iters, games_per_iter=games_per_iter,
+                 num_players=4, lr=1e-3, temperature=1.0, batch_size=256, seed=42)
+    except Exception as e:
+        print(f"\n[错误] 训练失败: {e}")
+        import traceback
+        traceback.print_exc()
+
+
+def train_menu():
+    """训练子菜单。"""
+    while True:
+        print(f"\n{'='*60}")
+        print(f"  训练子菜单")
+        print(f"{'='*60}")
+        print("  1. 遗传算法训练（推荐，4 种群并行）")
+        print("  2. 单种群训练（简单）")
+        print("  3. 查看当前模型统计")
+        print("  0. 返回主菜单")
+        try:
+            choice = input("\n请选择 [0-3]: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            return
+
+        if choice == '1':
+            try:
+                gens = int(input("进化代数 (回车=10): ").strip() or '10')
+                iters = int(input("每代训练轮数 (回车=8): ").strip() or '8')
+                workers = int(input("并行进程数 (回车=4): ").strip() or '4')
+            except ValueError:
+                gens, iters, workers = 10, 8, 4
+            run_genetic_train(gens, iters, workers)
+        elif choice == '2':
+            try:
+                iters = int(input("训练轮数 (回车=100): ").strip() or '100')
+                games = int(input("每轮局数 (回车=24): ").strip() or '24')
+            except ValueError:
+                iters, games = 100, 24
+            run_single_train(iters, games)
+        elif choice == '3':
+            net = load_net()
+            show_stats(net)
+        elif choice == '0':
+            return
+
+
 def interactive_menu(net):
     """交互式菜单。"""
     while True:
@@ -373,9 +599,10 @@ def interactive_menu(net):
         print("  2. 人机对弈")
         print("  3. 查看模型统计")
         print("  4. 多局观战（统计胜率）")
+        print("  5. 训练 AI（遗传算法/单种群）")
         print("  0. 退出")
         try:
-            choice = input("\n请选择 [1-4]: ").strip()
+            choice = input("\n请选择 [0-5]: ").strip()
         except (EOFError, KeyboardInterrupt):
             print("\n再见！")
             return
@@ -419,6 +646,8 @@ def interactive_menu(net):
             print(f"  {n} 局统计:")
             for i in range(4):
                 print(f"  P{i+1}: {wins[i]} 胜 ({wins[i]/n*100:.1f}%)")
+        elif choice == '5':
+            train_menu()
         elif choice == '0':
             print("再见！")
             return
@@ -429,6 +658,12 @@ def interactive_menu(net):
 def main():
     if len(sys.argv) > 1:
         cmd = sys.argv[1]
+        if cmd == 'train':
+            gens = int(sys.argv[2]) if len(sys.argv) > 2 else 10
+            iters = int(sys.argv[3]) if len(sys.argv) > 3 else 8
+            workers = int(sys.argv[4]) if len(sys.argv) > 4 else 4
+            run_genetic_train(gens, iters, workers)
+            return
         net = load_net()
         if cmd == 'watch':
             seed = int(sys.argv[2]) if len(sys.argv) > 2 else 0
@@ -443,7 +678,11 @@ def main():
             show_stats(net)
         else:
             print(f"未知命令: {cmd}")
-            print("用法: ai_game [watch|human|stats] [参数...]")
+            print("用法: ai_game [watch|human|stats|train] [参数...]")
+            print("  watch [seed] [temp] [turns]  观战")
+            print("  human [seat] [seed]          人机对弈")
+            print("  stats                        模型统计")
+            print("  train [gens] [iters] [workers]  训练")
     else:
         net = load_net()
         interactive_menu(net)
